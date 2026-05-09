@@ -9,6 +9,37 @@ const STATIC_ROLE_EXPANSIONS = {
   "ai governance": ["AI Governance Manager", "Responsible AI Manager", "AI Risk Manager", "AI Compliance Manager", "AI Assurance Manager", "Model Risk Manager", "AI Policy Manager", "AI Risk Management", "Responsible AI Lead"]
 };
 
+function formatDate(date) {
+  if (!date || Number.isNaN(date.getTime())) return "";
+  return date.toISOString().slice(0, 10);
+}
+
+function relativeToDate(value) {
+  const text = String(value || "").toLowerCase();
+  if (!text) return "";
+
+  const now = new Date();
+  const date = new Date(now);
+
+  if (text.includes("today") || text.includes("hour") || text.includes("minute") || text.includes("just now")) {
+    return formatDate(date);
+  }
+
+  const dayMatch = text.match(/(\d+)\s+day/);
+  if (dayMatch) {
+    date.setDate(now.getDate() - Number(dayMatch[1]));
+    return formatDate(date);
+  }
+
+  const weekMatch = text.match(/(\d+)\s+week/);
+  if (weekMatch) {
+    date.setDate(now.getDate() - Number(weekMatch[1]) * 7);
+    return formatDate(date);
+  }
+
+  return "";
+}
+
 async function expandRole(role) {
   const cleanRole = String(role || "").trim();
   const key = cleanRole.toLowerCase();
@@ -42,14 +73,14 @@ function postedWithin7Days(posted) {
 
 function normaliseJob(job, sourceQuery) {
   const apply = job.apply_options?.[0] || {};
-  const posted = job.detected_extensions?.posted_at || job.extensions?.find((x) => String(x).toLowerCase().includes("ago")) || "";
+  const postedRaw = job.detected_extensions?.posted_at || job.extensions?.find((x) => String(x).toLowerCase().includes("ago")) || "";
 
   return {
     role: job.title || "",
     company: job.company_name || "",
     location: job.location || "",
-    posted,
-    deadline: job.detected_extensions?.deadline || job.deadline || "",
+    postedDate: relativeToDate(postedRaw) || postedRaw,
+    deadlineDate: relativeToDate(job.detected_extensions?.deadline || "") || job.detected_extensions?.deadline || job.deadline || "",
     applyLink: apply.link || job.share_link || "",
     jobLink: job.share_link || "",
     description: job.description || "",
@@ -92,7 +123,7 @@ export default async function handler(req, res) {
       allJobs.push(...jobs);
     }
 
-    const unique = dedupeJobs(allJobs).filter((job) => postedWithin7Days(job.posted));
+    const unique = dedupeJobs(allJobs).filter((job) => postedWithin7Days(job.postedDate));
 
     return res.status(200).json({
       jobs: unique.slice(0, 30),
