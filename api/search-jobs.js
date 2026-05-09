@@ -3,67 +3,18 @@ import OpenAI from "openai";
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const STATIC_ROLE_EXPANSIONS = {
-  "sox": [
-    "SOX Manager",
-    "SOX Compliance Manager",
-    "SOX Controls Manager",
-    "Internal Controls Manager",
-    "IT Controls Manager",
-    "Technology Controls Manager",
-    "ITGC Manager",
-    "SOX ITGC",
-    "Financial Controls Manager",
-    "Internal Audit SOX"
-  ],
-  "it sox": [
-    "IT SOX Manager",
-    "SOX ITGC Manager",
-    "IT General Controls",
-    "ITGC",
-    "IT Controls Manager",
-    "Technology Controls Manager",
-    "SOX Compliance Manager",
-    "Internal Controls Technology",
-    "IT Audit SOX",
-    "Technology Risk Controls"
-  ],
-  "it auditor": [
-    "IT Auditor",
-    "Senior IT Auditor",
-    "Technology Auditor",
-    "IT Audit Manager",
-    "Technology Audit Manager",
-    "IT Risk Auditor",
-    "Internal Audit Technology",
-    "Technology Risk Assurance"
-  ],
-  "ai governance": [
-    "AI Governance Manager",
-    "Responsible AI Manager",
-    "AI Risk Manager",
-    "AI Compliance Manager",
-    "AI Assurance Manager",
-    "Model Risk Manager",
-    "AI Policy Manager",
-    "AI Risk Management",
-    "Responsible AI Lead"
-  ]
+  "sox": ["SOX Manager", "SOX Compliance Manager", "SOX Controls Manager", "Internal Controls Manager", "IT Controls Manager", "Technology Controls Manager", "ITGC Manager", "SOX ITGC", "Financial Controls Manager", "Internal Audit SOX"],
+  "it sox": ["IT SOX Manager", "SOX ITGC Manager", "IT General Controls", "ITGC", "IT Controls Manager", "Technology Controls Manager", "SOX Compliance Manager", "Internal Controls Technology", "IT Audit SOX", "Technology Risk Controls"],
+  "it auditor": ["IT Auditor", "Senior IT Auditor", "Technology Auditor", "IT Audit Manager", "Technology Audit Manager", "IT Risk Auditor", "Internal Audit Technology", "Technology Risk Assurance"],
+  "ai governance": ["AI Governance Manager", "Responsible AI Manager", "AI Risk Manager", "AI Compliance Manager", "AI Assurance Manager", "Model Risk Manager", "AI Policy Manager", "AI Risk Management", "Responsible AI Lead"]
 };
 
 async function expandRole(role) {
   const cleanRole = String(role || "").trim();
   const key = cleanRole.toLowerCase();
-
   const staticExpansions = STATIC_ROLE_EXPANSIONS[key] || [];
 
-  const prompt = `Expand this job search term into 8-12 real job titles and search phrases used in job listings.
-
-Important:
-- Include exact job titles AND adjacent titles.
-- Include compliance/control/audit variants where relevant.
-- Return ONLY a JSON array of strings.
-
-Search term: ${cleanRole}`;
+  const prompt = `Expand this job search term into 8-12 real job titles and search phrases used in job listings. Return ONLY a JSON array of strings. Search term: ${cleanRole}`;
 
   try {
     const response = await client.chat.completions.create({
@@ -71,7 +22,6 @@ Search term: ${cleanRole}`;
       messages: [{ role: "user", content: prompt }],
       temperature: 0.2,
     });
-
     const aiExpansions = JSON.parse(response.choices[0].message.content);
     return [...new Set([cleanRole, ...staticExpansions, ...aiExpansions])].slice(0, 12);
   } catch {
@@ -79,14 +29,27 @@ Search term: ${cleanRole}`;
   }
 }
 
+function postedWithin7Days(posted) {
+  const text = String(posted || "").toLowerCase();
+  if (!text) return true;
+  if (text.includes("today") || text.includes("hour") || text.includes("minute") || text.includes("just now")) return true;
+
+  const dayMatch = text.match(/(\d+)\s+day/);
+  if (dayMatch) return Number(dayMatch[1]) <= 7;
+
+  return false;
+}
+
 function normaliseJob(job, sourceQuery) {
   const apply = job.apply_options?.[0] || {};
+  const posted = job.detected_extensions?.posted_at || job.extensions?.find((x) => String(x).toLowerCase().includes("ago")) || "";
 
   return {
     role: job.title || "",
     company: job.company_name || "",
     location: job.location || "",
-    posted: job.detected_extensions?.posted_at || "",
+    posted,
+    deadline: job.detected_extensions?.deadline || job.deadline || "",
     applyLink: apply.link || job.share_link || "",
     jobLink: job.share_link || "",
     description: job.description || "",
@@ -96,30 +59,21 @@ function normaliseJob(job, sourceQuery) {
 
 function dedupeJobs(jobs) {
   const seen = new Map();
-
   for (const job of jobs) {
     const key = `${job.role}|${job.company}|${job.location}`.toLowerCase();
     if (!seen.has(key)) seen.set(key, job);
   }
-
   return Array.from(seen.values());
 }
 
 export default async function handler(req, res) {
   const { role, location } = req.query;
-
-  if (!role) {
-    return res.status(400).json({ error: "Role required" });
-  }
-
-  if (!process.env.SERPAPI_KEY) {
-    return res.status(500).json({ error: "Missing SERPAPI_KEY" });
-  }
+  if (!role) return res.status(400).json({ error: "Role required" });
+  if (!process.env.SERPAPI_KEY) return res.status(500).json({ error: "Missing SERPAPI_KEY" });
 
   try {
     const expandedRoles = await expandRole(role);
     const searchLocation = location || "London";
-
     let allJobs = [];
 
     for (const query of expandedRoles) {
@@ -134,20 +88,19 @@ export default async function handler(req, res) {
 
       const response = await fetch(`https://serpapi.com/search.json?${params}`);
       const data = await response.json();
-
       const jobs = (data.jobs_results || []).map((job) => normaliseJob(job, query));
       allJobs.push(...jobs);
     }
 
-    const unique = dedupeJobs(allJobs);
+    const unique = dedupeJobs(allJobs).filter((job) => postedWithin7Days(job.posted));
 
     return res.status(200).json({
       jobs: unique.slice(0, 30),
       expandedRoles,
       totalFetched: allJobs.length,
       totalUnique: unique.length,
+      filter: "last 7 days based on posted field where available",
     });
-
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
