@@ -249,8 +249,25 @@ async function findDatabaseByTitle(title) {
   return (data.results || []).find((database) => notionTitle(database) === title);
 }
 
+async function findChildDatabaseByTitle(parentPageId, title) {
+  const matches = [];
+  let cursor = undefined;
+  do {
+    const query = new URLSearchParams({ page_size: "100" });
+    if (cursor) query.set("start_cursor", cursor);
+    const data = await notionFetch(`/blocks/${parentPageId}/children?${query.toString()}`, { method: "GET" });
+    matches.push(...(data.results || []).filter((block) => block.type === "child_database" && block.child_database?.title === title));
+    cursor = data.has_more ? data.next_cursor : undefined;
+  } while (cursor);
+
+  return matches.sort((a, b) => String(b.created_time || "").localeCompare(String(a.created_time || "")))[0] || null;
+}
+
 async function ensureDatabase({ parentPageId, envId, title, properties }) {
   if (process.env[envId]) return process.env[envId];
+
+  const childExisting = await findChildDatabaseByTitle(parentPageId, title);
+  if (childExisting) return childExisting.id;
 
   const existing = await findDatabaseByTitle(title);
   if (existing) return existing.id;
