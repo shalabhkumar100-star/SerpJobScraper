@@ -1,8 +1,17 @@
 import OpenAI from "openai";
+import { flattenTargetRoles } from "../config/targetRoles.js";
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+const TARGET_ROLE_EXPANSIONS = Object.fromEntries(
+  flattenTargetRoles().map((role) => [
+    role.targetRole.toLowerCase(),
+    role.searchTerms,
+  ]),
+);
+
 const STATIC_ROLE_EXPANSIONS = {
+  ...TARGET_ROLE_EXPANSIONS,
   "sox": ["SOX Manager", "SOX Compliance Manager", "SOX Controls Manager", "Internal Controls Manager", "IT Controls Manager", "Technology Controls Manager", "ITGC Manager", "SOX ITGC", "Financial Controls Manager", "Internal Audit SOX"],
   "it sox": ["IT SOX Manager", "SOX ITGC Manager", "IT General Controls", "ITGC", "IT Controls Manager", "Technology Controls Manager", "SOX Compliance Manager", "Internal Controls Technology", "IT Audit SOX", "Technology Risk Controls"],
   "it auditor": ["IT Auditor", "Senior IT Auditor", "Technology Auditor", "IT Audit Manager", "Technology Audit Manager", "IT Risk Auditor", "Internal Audit Technology", "Technology Risk Assurance"],
