@@ -7,6 +7,9 @@ export const config = {
 const DEFAULT_LOCATION = "London, UK";
 const DEFAULT_NOTION_PAGE_ID = "35be4d9f-8fde-819d-9276-e5794940c9ca";
 const DEFAULT_APIFY_SOURCE_URL = "https://shalabhkumar100-star-jobscraper.vercel.app/api/search-jobs";
+const NOTION_VERSION = "2022-06-28";
+const RUNS_DATABASE_TITLE = "Job Runs";
+const JOBS_DATABASE_TITLE = "Job Opportunities";
 
 function getBaseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || "https";
@@ -30,6 +33,11 @@ function parseDate(value) {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
+function dateOnly(value) {
+  const date = parseDate(value);
+  return date ? date.toISOString().slice(0, 10) : null;
+}
+
 function isWithinLast7Days(job) {
   const posted = parseDate(job.postedDate || job.posted);
   if (!posted) return true;
@@ -40,12 +48,37 @@ function cleanText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function truncate(value, length = 1900) {
+  return cleanText(value).slice(0, length);
+}
+
+function validUrl(value) {
+  const text = cleanText(value);
+  if (!/^https?:\/\//i.test(text)) return null;
+  return text.slice(0, 2000);
+}
+
+function richText(value) {
+  const content = truncate(value) || " ";
+  return { rich_text: [{ type: "text", text: { content } }] };
+}
+
+function titleText(value) {
+  const content = truncate(value, 200) || "Untitled";
+  return { title: [{ type: "text", text: { content } }] };
+}
+
+function dateProperty(value) {
+  const start = dateOnly(value);
+  return start ? { date: { start } } : null;
+}
+
 function jobKey(job) {
   const link = cleanText(job.applyLink || job.jobLink).toLowerCase();
   if (link) return `link:${link}`;
   return [
-    cleanText(job.role).toLowerCase(),
     cleanText(job.company).toLowerCase(),
+    cleanText(job.role).toLowerCase(),
     cleanText(job.location).toLowerCase(),
   ].join("|");
 }
@@ -71,6 +104,20 @@ function dedupeJobs(jobs) {
     });
   }
   return Array.from(seen.values());
+}
+
+function getIsoWeek(value) {
+  const date = new Date(value);
+  const utcDate = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const day = utcDate.getUTCDay() || 7;
+  utcDate.setUTCDate(utcDate.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(utcDate.getUTCFullYear(), 0, 1));
+  const week = Math.ceil(((utcDate - yearStart) / 86400000 + 1) / 7);
+  return `${utcDate.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+}
+
+function getRunKey(startedAt) {
+  return process.env.NOTION_RUN_KEY || `weekly-run-${getIsoWeek(startedAt)}`;
 }
 
 function roleAlignmentScore(job) {
@@ -103,7 +150,7 @@ function normaliseSourceJob(job, source, target) {
     company: cleanText(job.company),
     location: cleanText(job.location),
     source: cleanText(job.source || source),
-    sources: [cleanText(job.source || source)],
+    sources: [cleanText(job.source || source)].filter(Boolean),
     posted: cleanText(job.posted),
     postedDate: cleanText(job.postedDate),
     deadlineDate: cleanText(job.deadlineDate || job.deadline),
@@ -169,102 +216,230 @@ async function runApifySearch(target, location) {
   };
 }
 
-function notionText(text, link) {
-  const content = String(text || "").slice(0, 1900) || " ";
-  return {
-    type: "text",
-    text: link ? { content, link: { url: link } } : { content },
-  };
-}
-
-function paragraph(text) {
-  return { object: "block", type: "paragraph", paragraph: { rich_text: [notionText(text)] } };
-}
-
-function heading(text, level = 2) {
-  const type = level === 3 ? "heading_3" : "heading_2";
-  return { object: "block", type, [type]: { rich_text: [notionText(text)] } };
-}
-
-function bullet(text) {
-  return { object: "block", type: "bulleted_list_item", bulleted_list_item: { rich_text: [notionText(text)] } };
-}
-
-function jobBlock(job, index) {
-  const title = `${index}. ${job.role || "Untitled role"} - ${job.company || "Unknown company"}`;
-  const link = job.applyLink || job.jobLink || undefined;
-  const details = [
-    job.location && `Location: ${job.location}`,
-    job.postedDate && `Posted: ${job.postedDate}`,
-    job.deadlineDate && `Deadline: ${job.deadlineDate}`,
-    job.roleCluster && `Cluster: ${job.roleCluster}`,
-    job.targetRole && `Target role: ${job.targetRole}`,
-    job.sources?.length && `Sources: ${job.sources.join(", ")}`,
-    job.sourceQueries?.length && `Queries: ${job.sourceQueries.join(", ")}`,
-    Number.isFinite(job.relevanceScore) && `Relevance score: ${job.relevanceScore}`,
-  ].filter(Boolean).join(" | ");
-
-  return {
-    object: "block",
-    type: "bulleted_list_item",
-    bulleted_list_item: {
-      rich_text: [notionText(title, link), notionText(details ? `\n${details}` : "")],
+async function notionFetch(path, options = {}) {
+  const response = await fetch(`https://api.notion.com/v1${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+      "Content-Type": "application/json",
+      "Notion-Version": NOTION_VERSION,
+      ...(options.headers || {}),
     },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.message || `Notion API error ${response.status}`);
+  }
+  return data;
+}
+
+function notionTitle(database) {
+  return (database.title || []).map((item) => item.plain_text || item.text?.content || "").join("");
+}
+
+async function findDatabaseByTitle(title) {
+  const data = await notionFetch("/search", {
+    method: "POST",
+    body: JSON.stringify({
+      query: title,
+      filter: { property: "object", value: "database" },
+      page_size: 20,
+    }),
+  });
+  return (data.results || []).find((database) => notionTitle(database) === title);
+}
+
+async function ensureDatabase({ parentPageId, envId, title, properties }) {
+  if (process.env[envId]) return process.env[envId];
+
+  const existing = await findDatabaseByTitle(title);
+  if (existing) return existing.id;
+
+  const created = await notionFetch("/databases", {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { type: "page_id", page_id: parentPageId },
+      title: [{ type: "text", text: { content: title } }],
+      properties,
+    }),
+  });
+  return created.id;
+}
+
+async function queryDatabase(databaseId, filter) {
+  const data = await notionFetch(`/databases/${databaseId}/query`, {
+    method: "POST",
+    body: JSON.stringify({ filter, page_size: 1 }),
+  });
+  return (data.results || [])[0] || null;
+}
+
+async function upsertPage({ databaseId, filter, properties, icon }) {
+  const existing = await queryDatabase(databaseId, filter);
+  if (existing) {
+    const updated = await notionFetch(`/pages/${existing.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ properties, icon }),
+    });
+    return { pageId: updated.id, url: updated.url, action: "updated" };
+  }
+
+  const created = await notionFetch("/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { database_id: databaseId },
+      icon,
+      properties,
+    }),
+  });
+  return { pageId: created.id, url: created.url, action: "created" };
+}
+
+function runStatus(errors, sourceStats) {
+  const totalFailures = sourceStats.reduce((sum, stat) => sum + stat.failures, 0);
+  const totalSuccesses = sourceStats.reduce((sum, stat) => sum + stat.successes, 0);
+  if (errors.length && !totalSuccesses) return "Failed";
+  if (errors.length || totalFailures) return "Partial";
+  return "Completed";
+}
+
+function sourceSummary(sourceStats) {
+  return sourceStats
+    .map((stat) => `${stat.source}: ${stat.successes} ok, ${stat.failures} failed, ${stat.jobs} fetched`)
+    .join("; ");
+}
+
+function errorSummary(errors) {
+  if (!errors.length) return "No source errors recorded.";
+  return errors
+    .slice(0, 20)
+    .map((error) => `${error.source} | ${error.targetRole}: ${error.message}`)
+    .join("\n");
+}
+
+function buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats }) {
+  const runDate = dateProperty(startedAt);
+  return {
+    "Run Key": titleText(runKey),
+    ...(runDate ? { "Run Date": runDate } : {}),
+    "Run Week": richText(getIsoWeek(startedAt)),
+    Source: richText(sourceSummary(sourceStats)),
+    Status: { select: { name: runStatus(errors, sourceStats) } },
+    Location: richText(location),
+    "Target Roles": { number: targets.length },
+    "Total Fetched": { number: jobs.length },
+    "Total Unique": { number: uniqueJobs.length },
+    Errors: richText(errorSummary(errors)),
+    "Started At": { date: { start: startedAt } },
+    "Finished At": { date: { start: finishedAt } },
   };
 }
 
-function buildNotionBlocks({ startedAt, finishedAt, location, targets, jobs, errors, sourceStats }) {
-  const topJobs = sortJobs(jobs).slice(0, Number(process.env.NOTION_TOP_JOBS || 20));
-  const clusterCounts = TARGET_ROLE_CLUSTERS.map((cluster) => {
-    const count = jobs.filter((job) => job.roleCluster === cluster.cluster).length;
-    return `${cluster.cluster}: ${count}`;
-  });
-
-  return [
-    paragraph(`Run window: last 7 days. Location: ${location}. Started: ${startedAt}. Finished: ${finishedAt}.`),
-    heading("Summary"),
-    bullet(`Target roles searched: ${targets.length}`),
-    bullet(`Unique opportunities found: ${jobs.length}`),
-    bullet(`Top jobs shown: ${topJobs.length}`),
-    ...clusterCounts.map(bullet),
-    heading("Source Health"),
-    ...sourceStats.map((stat) => bullet(`${stat.source}: ${stat.successes} successful role searches, ${stat.failures} failed role searches, ${stat.jobs} jobs returned before final dedupe.`)),
-    ...(errors.length ? [heading("Errors"), ...errors.slice(0, 25).map((error) => bullet(`${error.source} | ${error.targetRole}: ${error.message}`))] : [heading("Errors"), paragraph("No source errors recorded.")]),
-    heading("Top Opportunities"),
-    ...(topJobs.length ? topJobs.map((job, index) => jobBlock(job, index + 1)) : [paragraph("No opportunities were returned for this run.")]),
-  ];
+function buildJobProperties(job, runKey, finishedAt) {
+  const applyLink = validUrl(job.applyLink);
+  const jobLink = validUrl(job.jobLink);
+  const postedDate = dateProperty(job.postedDate || job.posted);
+  const deadlineDate = dateProperty(job.deadlineDate);
+  return {
+    Job: titleText(job.role || "Untitled role"),
+    "Job Key": richText(jobKey(job)),
+    Company: richText(job.company || "Unknown company"),
+    Location: richText(job.location || "Unknown location"),
+    Source: { multi_select: [...new Set(job.sources || [job.source].filter(Boolean))].map((name) => ({ name: truncate(name, 100) })) },
+    "Role Cluster": job.roleCluster ? { select: { name: truncate(job.roleCluster, 100) } } : { select: null },
+    "Target Role": richText(job.targetRole),
+    ...(postedDate ? { "Posted Date": postedDate } : {}),
+    ...(deadlineDate ? { "Deadline Date": deadlineDate } : {}),
+    "Relevance Score": { number: Number(job.relevanceScore || 0) },
+    "Run Key": richText(runKey),
+    Status: { select: { name: "New" } },
+    ...(applyLink ? { "Apply Link": { url: applyLink } } : {}),
+    ...(jobLink ? { "Job Link": { url: jobLink } } : {}),
+    "Source Query": richText((job.sourceQueries || []).join(", ")),
+    "Last Seen": { date: { start: finishedAt } },
+  };
 }
 
-async function createNotionRunPage({ startedAt, finishedAt, location, targets, jobs, errors, sourceStats }) {
+async function writeNotionResults({ startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats }) {
   if (!process.env.NOTION_TOKEN) {
     return { skipped: true, reason: "Missing NOTION_TOKEN" };
   }
 
   const parentPageId = process.env.NOTION_WEEKLY_JOBS_PAGE_ID || DEFAULT_NOTION_PAGE_ID;
-  const title = `Job Opportunities Run - ${new Date(startedAt).toISOString().slice(0, 10)}`;
-  const response = await fetch("https://api.notion.com/v1/pages", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${process.env.NOTION_TOKEN}`,
-      "Content-Type": "application/json",
-      "Notion-Version": "2022-06-28",
+  const runKey = getRunKey(startedAt);
+  const runsDatabaseId = await ensureDatabase({
+    parentPageId,
+    envId: "NOTION_RUNS_DATABASE_ID",
+    title: RUNS_DATABASE_TITLE,
+    properties: {
+      "Run Key": { title: {} },
+      "Run Date": { date: {} },
+      "Run Week": { rich_text: {} },
+      Source: { rich_text: {} },
+      Status: { select: {} },
+      Location: { rich_text: {} },
+      "Target Roles": { number: {} },
+      "Total Fetched": { number: {} },
+      "Total Unique": { number: {} },
+      Errors: { rich_text: {} },
+      "Started At": { date: {} },
+      "Finished At": { date: {} },
     },
-    body: JSON.stringify({
-      parent: { page_id: parentPageId },
-      icon: { type: "emoji", emoji: "🔎" },
-      properties: {
-        title: [{ type: "text", text: { content: title } }],
-      },
-      children: buildNotionBlocks({ startedAt, finishedAt, location, targets, jobs, errors, sourceStats }).slice(0, 95),
-    }),
+  });
+  const jobsDatabaseId = await ensureDatabase({
+    parentPageId,
+    envId: "NOTION_JOBS_DATABASE_ID",
+    title: JOBS_DATABASE_TITLE,
+    properties: {
+      Job: { title: {} },
+      "Job Key": { rich_text: {} },
+      Company: { rich_text: {} },
+      Location: { rich_text: {} },
+      Source: { multi_select: {} },
+      "Role Cluster": { select: {} },
+      "Target Role": { rich_text: {} },
+      "Posted Date": { date: {} },
+      "Deadline Date": { date: {} },
+      "Relevance Score": { number: {} },
+      "Run Key": { rich_text: {} },
+      Status: { select: {} },
+      "Apply Link": { url: {} },
+      "Job Link": { url: {} },
+      "Source Query": { rich_text: {} },
+      "Last Seen": { date: {} },
+    },
   });
 
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.message || "Notion page creation failed");
+  const run = await upsertPage({
+    databaseId: runsDatabaseId,
+    filter: { property: "Run Key", title: { equals: runKey } },
+    icon: { type: "emoji", emoji: "🔎" },
+    properties: buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats }),
+  });
+
+  const jobResults = [];
+  for (const job of sortJobs(uniqueJobs).slice(0, Number(process.env.NOTION_MAX_JOB_ROWS || 100))) {
+    const key = jobKey(job);
+    const result = await upsertPage({
+      databaseId: jobsDatabaseId,
+      filter: { property: "Job Key", rich_text: { equals: key } },
+      icon: { type: "emoji", emoji: "💼" },
+      properties: buildJobProperties(job, runKey, finishedAt),
+    });
+    jobResults.push(result);
   }
 
-  return { pageId: data.id, url: data.url };
+  return {
+    runKey,
+    runsDatabaseId,
+    jobsDatabaseId,
+    runPageId: run.pageId,
+    runUrl: run.url,
+    runAction: run.action,
+    jobRowsCreated: jobResults.filter((result) => result.action === "created").length,
+    jobRowsUpdated: jobResults.filter((result) => result.action === "updated").length,
+    jobRowsTouched: jobResults.length,
+  };
 }
 
 function getSelectedTargets(req) {
@@ -291,12 +466,14 @@ export default async function handler(req, res) {
 
   const startedAt = new Date().toISOString();
   const runId = getRunId();
+  const runKey = getRunKey(startedAt);
   const location = cleanText(req.query.location || req.body?.location || process.env.WEEKLY_SEARCH_LOCATION || DEFAULT_LOCATION);
   const targets = getSelectedTargets(req);
 
   if (req.query.dryRun === "1" || req.query.dryRun === "true") {
     return res.status(200).json({
       runId,
+      runKey,
       dryRun: true,
       location,
       targetRolesSearched: targets.length,
@@ -306,6 +483,10 @@ export default async function handler(req, res) {
         process.env.APIFY_SOURCE_URL || DEFAULT_APIFY_SOURCE_URL,
       ],
       notionParentPageId: process.env.NOTION_WEEKLY_JOBS_PAGE_ID || DEFAULT_NOTION_PAGE_ID,
+      notionDatabases: {
+        runs: process.env.NOTION_RUNS_DATABASE_ID || RUNS_DATABASE_TITLE,
+        jobs: process.env.NOTION_JOBS_DATABASE_ID || JOBS_DATABASE_TITLE,
+      },
       schedule: "0 9 * * 0",
     });
   }
@@ -347,12 +528,13 @@ export default async function handler(req, res) {
 
   let notion = null;
   try {
-    notion = await createNotionRunPage({
+    notion = await writeNotionResults({
       startedAt,
       finishedAt,
       location,
       targets,
-      jobs: sortedJobs,
+      jobs,
+      uniqueJobs: sortedJobs,
       errors,
       sourceStats,
     });
@@ -362,6 +544,7 @@ export default async function handler(req, res) {
 
   return res.status(200).json({
     runId,
+    runKey,
     location,
     startedAt,
     finishedAt,
