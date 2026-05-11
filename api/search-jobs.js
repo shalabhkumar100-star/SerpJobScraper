@@ -112,7 +112,9 @@ export default async function handler(req, res) {
   if (!role) return res.status(400).json({ error: "Role required" });
   if (!process.env.SERPAPI_KEY) return res.status(500).json({ error: "Missing SERPAPI_KEY" });
   try {
-    const expandedRoles = await expandRole(role);
+    const shouldExpand = !["0", "false", "no"].includes(String(req.query.expand || "1").toLowerCase());
+    const maxQueries = Number(req.query.maxQueries || 12);
+    const expandedRoles = (shouldExpand ? await expandRole(role) : [String(role).trim()]).slice(0, maxQueries);
     const searchLocation = location || "London";
     let allJobs = [];
     for (const query of expandedRoles) {
