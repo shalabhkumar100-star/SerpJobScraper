@@ -145,6 +145,8 @@ async function runSerpSearch(req, target, location) {
   const url = new URL(sourceUrl);
   url.searchParams.set("role", target.query);
   url.searchParams.set("location", location);
+  url.searchParams.set("expand", "0");
+  url.searchParams.set("maxQueries", "1");
   const data = await fetchJson(url.toString());
   return {
     source: "SerpAPI / Google Jobs",
@@ -158,7 +160,7 @@ async function runApifySearch(target, location) {
   const data = await fetchJson(sourceUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ role: target.query, location }),
+    body: JSON.stringify({ role: target.query, location, expand: false, maxQueries: 1, count: 10 }),
   });
   return {
     source: "LinkedIn / Apify",
