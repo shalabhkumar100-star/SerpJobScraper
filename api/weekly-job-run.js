@@ -12,6 +12,7 @@ const RUNS_DATABASE_TITLE = "Job Runs";
 const JOBS_DATABASE_TITLE = "Job Opportunities";
 const SERP_SOURCE_NAME = "SerpAPI / Google Jobs";
 const APIFY_SOURCE_NAME = "LinkedIn / Apify";
+const LINKEDIN_JOB_SOURCE = "LinkedIn";
 
 function getBaseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || "https";
@@ -75,14 +76,41 @@ function dateProperty(value) {
   return start ? { date: { start } } : null;
 }
 
+function normalizeSourceName(source) {
+  const text = cleanText(source);
+  const lower = text.toLowerCase();
+  if (!text) return null;
+  if (lower.includes("linkedin") || lower.includes("apify")) return LINKEDIN_JOB_SOURCE;
+  if (lower.includes("serp") || lower.includes("google")) return SERP_SOURCE_NAME;
+  return text;
+}
+
+function uniqueNames(values) {
+  return [...new Set(values.map(normalizeSourceName).filter(Boolean))];
+}
+
+function multiSelect(values) {
+  return { multi_select: uniqueNames(values).map((name) => ({ name: truncate(name, 100) })) };
+}
+
+function jobSources(job) {
+  return uniqueNames([...(job.sources || []), job.source]);
+}
+
+function actualJobSources(jobs) {
+  return uniqueNames(jobs.flatMap((job) => jobSources(job)));
+}
+
 function jobKey(job) {
-  const link = cleanText(job.applyLink || job.jobLink).toLowerCase();
-  if (link) return `link:${link}`;
-  return [
+  const roleCompanyLocation = [
     cleanText(job.company).toLowerCase(),
     cleanText(job.role).toLowerCase(),
     cleanText(job.location).toLowerCase(),
   ].join("|");
+  if (roleCompanyLocation !== "||") return roleCompanyLocation;
+
+  const link = cleanText(job.applyLink || job.jobLink).toLowerCase();
+  return link ? `link:${link}` : "";
 }
 
 function dedupeJobs(jobs) {
@@ -97,7 +125,7 @@ function dedupeJobs(jobs) {
     }
     seen.set(key, {
       ...existing,
-      sources: [...new Set([...(existing.sources || []), ...(job.sources || [])])],
+      sources: uniqueNames([...(existing.sources || []), ...(job.sources || [])]),
       sourceQueries: [...new Set([...(existing.sourceQueries || []), ...(job.sourceQueries || [])])],
       relevanceScore: Math.max(Number(existing.relevanceScore || 0), Number(job.relevanceScore || 0)),
       applyLink: existing.applyLink || job.applyLink,
@@ -161,12 +189,13 @@ function sortJobs(jobs) {
 }
 
 function normaliseSourceJob(job, source, target) {
+  const normalizedSource = normalizeSourceName(job.source || source);
   return {
     role: cleanText(job.role),
     company: cleanText(job.company),
     location: cleanText(job.location),
-    source: cleanText(job.source || source),
-    sources: [cleanText(job.source || source)].filter(Boolean),
+    source: normalizedSource,
+    sources: [normalizedSource].filter(Boolean),
     posted: cleanText(job.posted),
     postedDate: cleanText(job.postedDate),
     deadlineDate: cleanText(job.deadlineDate || job.deadline),
@@ -227,7 +256,7 @@ async function runApifySearch(target, location) {
   });
   return {
     source: APIFY_SOURCE_NAME,
-    jobs: (data.jobs || []).map((job) => normaliseSourceJob(job, APIFY_SOURCE_NAME, target)),
+    jobs: (data.jobs || []).map((job) => normaliseSourceJob(job, LINKEDIN_JOB_SOURCE, target)),
     meta: data,
   };
 }
@@ -264,6 +293,24 @@ function notionTitle(database) {
   return (database.title || []).map((item) => item.plain_text || item.text?.content || "").join("");
 }
 
+async function getDatabase(databaseId) {
+  return notionFetch(`/databases/${databaseId}`, { method: "GET" });
+}
+
+async function syncDatabaseProperties(databaseId, desiredProperties) {
+  const database = await getDatabase(databaseId);
+  const missing = Object.fromEntries(
+    Object.entries(desiredProperties).filter(([name]) => !database.properties?.[name])
+  );
+  if (Object.keys(missing).length) {
+    await notionFetch(`/databases/${databaseId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ properties: missing }),
+    });
+  }
+  return databaseId;
+}
+
 async function findDatabaseByTitle(title) {
   const data = await notionFetch("/search", {
     method: "POST",
@@ -291,13 +338,13 @@ async function findChildDatabaseByTitle(parentPageId, title) {
 }
 
 async function ensureDatabase({ parentPageId, envId, title, properties }) {
-  if (process.env[envId]) return process.env[envId];
+  if (process.env[envId]) return syncDatabaseProperties(process.env[envId], properties);
 
   const childExisting = await findChildDatabaseByTitle(parentPageId, title);
-  if (childExisting) return childExisting.id;
+  if (childExisting) return syncDatabaseProperties(childExisting.id, properties);
 
   const existing = await findDatabaseByTitle(title);
-  if (existing) return existing.id;
+  if (existing) return syncDatabaseProperties(existing.id, properties);
 
   const created = await notionFetch("/databases", {
     method: "POST",
@@ -335,6 +382,37 @@ async function upsertPage({ databaseId, filter, properties, icon }) {
   return { pageId: created.id, url: created.url, action: "created" };
 }
 
+function getExistingMultiSelectNames(page, propertyName) {
+  return (page?.properties?.[propertyName]?.multi_select || [])
+    .map((item) => item.name)
+    .filter(Boolean);
+}
+
+async function upsertJobPage({ databaseId, job, runKey, finishedAt }) {
+  const key = jobKey(job);
+  const existing = await queryDatabase(databaseId, { property: "Job Key", rich_text: { equals: key } });
+  const existingSources = getExistingMultiSelectNames(existing, "Source");
+  const properties = buildJobProperties(job, runKey, finishedAt, existingSources);
+
+  if (existing) {
+    const updated = await notionFetch(`/pages/${existing.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ properties, icon: { type: "emoji", emoji: "💼" } }),
+    });
+    return { pageId: updated.id, url: updated.url, action: "updated" };
+  }
+
+  const created = await notionFetch("/pages", {
+    method: "POST",
+    body: JSON.stringify({
+      parent: { database_id: databaseId },
+      icon: { type: "emoji", emoji: "💼" },
+      properties,
+    }),
+  });
+  return { pageId: created.id, url: created.url, action: "created" };
+}
+
 function runStatus(errors, sourceStats) {
   const totalFailures = sourceStats.reduce((sum, stat) => sum + stat.failures, 0);
   const totalSuccesses = sourceStats.reduce((sum, stat) => sum + stat.successes, 0);
@@ -343,11 +421,10 @@ function runStatus(errors, sourceStats) {
   return "Completed";
 }
 
-function sourceSummary(sourceStats, sourceMode) {
-  const stats = sourceStats
+function sourceStatsSummary(sourceStats) {
+  return sourceStats
     .map((stat) => `${stat.source}: ${stat.successes} ok, ${stat.failures} failed, ${stat.jobs} fetched`)
     .join("; ");
-  return `Mode: ${sourceMode}; ${stats}`;
 }
 
 function errorSummary(errors) {
@@ -360,11 +437,16 @@ function errorSummary(errors) {
 
 function buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats, sourceMode }) {
   const runDate = dateProperty(startedAt);
+  const jobSourceNames = actualJobSources(uniqueJobs);
+  const stats = sourceStatsSummary(sourceStats);
   return {
     "Run Key": titleText(runKey),
     ...(runDate ? { "Run Date": runDate } : {}),
     "Run Week": richText(getIsoWeek(startedAt)),
-    Source: richText(sourceSummary(sourceStats, sourceMode)),
+    "Source Mode": { select: { name: sourceMode } },
+    "Job Sources": multiSelect(jobSourceNames),
+    "Source Stats": richText(stats),
+    Source: richText(`Mode: ${sourceMode}; Job sources: ${jobSourceNames.join(", ") || "none"}; ${stats}`),
     Status: { select: { name: runStatus(errors, sourceStats) } },
     Location: richText(location),
     "Target Roles": { number: targets.length },
@@ -376,17 +458,18 @@ function buildRunProperties({ runKey, startedAt, finishedAt, location, targets, 
   };
 }
 
-function buildJobProperties(job, runKey, finishedAt) {
+function buildJobProperties(job, runKey, finishedAt, existingSources = []) {
   const applyLink = validUrl(job.applyLink);
   const jobLink = validUrl(job.jobLink);
   const postedDate = dateProperty(job.postedDate || job.posted);
   const deadlineDate = dateProperty(job.deadlineDate);
+  const mergedSources = uniqueNames([...existingSources, ...jobSources(job)]);
   return {
     Job: titleText(job.role || "Untitled role"),
     "Job Key": richText(jobKey(job)),
     Company: richText(job.company || "Unknown company"),
     Location: richText(job.location || "Unknown location"),
-    Source: { multi_select: [...new Set(job.sources || [job.source].filter(Boolean))].map((name) => ({ name: truncate(name, 100) })) },
+    Source: multiSelect(mergedSources),
     "Role Cluster": job.roleCluster ? { select: { name: truncate(job.roleCluster, 100) } } : { select: null },
     "Target Role": richText(job.targetRole),
     ...(postedDate ? { "Posted Date": postedDate } : {}),
@@ -416,6 +499,9 @@ async function writeNotionResults({ startedAt, finishedAt, location, targets, jo
       "Run Key": { title: {} },
       "Run Date": { date: {} },
       "Run Week": { rich_text: {} },
+      "Source Mode": { select: {} },
+      "Job Sources": { multi_select: {} },
+      "Source Stats": { rich_text: {} },
       Source: { rich_text: {} },
       Status: { select: {} },
       Location: { rich_text: {} },
@@ -460,19 +546,14 @@ async function writeNotionResults({ startedAt, finishedAt, location, targets, jo
 
   const jobResults = [];
   for (const job of sortJobs(uniqueJobs).slice(0, Number(process.env.NOTION_MAX_JOB_ROWS || 100))) {
-    const key = jobKey(job);
-    const result = await upsertPage({
-      databaseId: jobsDatabaseId,
-      filter: { property: "Job Key", rich_text: { equals: key } },
-      icon: { type: "emoji", emoji: "💼" },
-      properties: buildJobProperties(job, runKey, finishedAt),
-    });
+    const result = await upsertJobPage({ databaseId: jobsDatabaseId, job, runKey, finishedAt });
     jobResults.push(result);
   }
 
   return {
     runKey,
     sourceMode,
+    actualJobSources: actualJobSources(uniqueJobs),
     runsDatabaseId,
     jobsDatabaseId,
     runPageId: run.pageId,
@@ -589,6 +670,7 @@ export default async function handler(req, res) {
     targetRolesSearched: targets.length,
     totalReturned: jobs.length,
     totalUniqueLast7Days: sortedJobs.length,
+    actualJobSources: actualJobSources(sortedJobs),
     sourceStats,
     errors,
     notion,
