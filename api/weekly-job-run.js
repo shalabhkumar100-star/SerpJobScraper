@@ -1,4 +1,4 @@
-import { flattenTargetRoles, TARGET_ROLE_CLUSTERS } from "../config/targetRoles.js";
+import { flattenTargetRoles } from "../config/targetRoles.js";
 
 export const config = {
   maxDuration: 300,
@@ -10,6 +10,8 @@ const DEFAULT_APIFY_SOURCE_URL = "https://shalabhkumar100-star-jobscraper.vercel
 const NOTION_VERSION = "2022-06-28";
 const RUNS_DATABASE_TITLE = "Job Runs";
 const JOBS_DATABASE_TITLE = "Job Opportunities";
+const SERP_SOURCE_NAME = "SerpAPI / Google Jobs";
+const APIFY_SOURCE_NAME = "LinkedIn / Apify";
 
 function getBaseUrl(req) {
   const proto = req.headers["x-forwarded-proto"] || "https";
@@ -120,13 +122,27 @@ function getRunKey(startedAt) {
   return process.env.NOTION_RUN_KEY || `weekly-run-${getIsoWeek(startedAt)}`;
 }
 
+function getSourceMode(req) {
+  const value = cleanText(req.query.source || req.body?.source || process.env.WEEKLY_SOURCE_MODE || "both").toLowerCase();
+  if (["serp", "serpapi", "google", "google-jobs", "google_jobs"].includes(value)) return "serp";
+  if (["apify", "linkedin", "linked-in"].includes(value)) return "apify";
+  return "both";
+}
+
+function sourceUrls(req, sourceMode) {
+  const urls = [];
+  if (sourceMode === "both" || sourceMode === "serp") {
+    urls.push({ source: SERP_SOURCE_NAME, url: process.env.SERP_SOURCE_URL || `${getBaseUrl(req)}/api/search-jobs` });
+  }
+  if (sourceMode === "both" || sourceMode === "apify") {
+    urls.push({ source: APIFY_SOURCE_NAME, url: process.env.APIFY_SOURCE_URL || DEFAULT_APIFY_SOURCE_URL });
+  }
+  return urls;
+}
+
 function roleAlignmentScore(job) {
   const text = `${job.role || ""} ${job.description || ""}`.toLowerCase();
-  const terms = [
-    job.targetRole,
-    ...(job.targetSearchTerms || []),
-    job.roleCluster,
-  ]
+  const terms = [job.targetRole, ...(job.targetSearchTerms || []), job.roleCluster]
     .filter(Boolean)
     .flatMap((term) => String(term).toLowerCase().split(/[,/]/))
     .map((term) => term.trim())
@@ -179,7 +195,7 @@ async function fetchJson(url, options = {}) {
       data = { raw: text };
     }
     if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
+      throw new Error(data.error || data.raw || `HTTP ${response.status}`);
     }
     return data;
   } finally {
@@ -196,8 +212,8 @@ async function runSerpSearch(req, target, location) {
   url.searchParams.set("maxQueries", "1");
   const data = await fetchJson(url.toString());
   return {
-    source: "SerpAPI / Google Jobs",
-    jobs: (data.jobs || []).map((job) => normaliseSourceJob(job, "SerpAPI / Google Jobs", target)),
+    source: SERP_SOURCE_NAME,
+    jobs: (data.jobs || []).map((job) => normaliseSourceJob(job, SERP_SOURCE_NAME, target)),
     meta: data,
   };
 }
@@ -210,10 +226,21 @@ async function runApifySearch(target, location) {
     body: JSON.stringify({ role: target.query, location, expand: false, maxQueries: 1, count: 10 }),
   });
   return {
-    source: "LinkedIn / Apify",
-    jobs: (data.jobs || []).map((job) => normaliseSourceJob(job, "LinkedIn / Apify", target)),
+    source: APIFY_SOURCE_NAME,
+    jobs: (data.jobs || []).map((job) => normaliseSourceJob(job, APIFY_SOURCE_NAME, target)),
     meta: data,
   };
+}
+
+function plannedSourcesFor(req, target, location, sourceMode) {
+  const sources = [];
+  if (sourceMode === "both" || sourceMode === "serp") {
+    sources.push({ source: SERP_SOURCE_NAME, run: () => runSerpSearch(req, target, location) });
+  }
+  if (sourceMode === "both" || sourceMode === "apify") {
+    sources.push({ source: APIFY_SOURCE_NAME, run: () => runApifySearch(target, location) });
+  }
+  return sources;
 }
 
 async function notionFetch(path, options = {}) {
@@ -303,11 +330,7 @@ async function upsertPage({ databaseId, filter, properties, icon }) {
 
   const created = await notionFetch("/pages", {
     method: "POST",
-    body: JSON.stringify({
-      parent: { database_id: databaseId },
-      icon,
-      properties,
-    }),
+    body: JSON.stringify({ parent: { database_id: databaseId }, icon, properties }),
   });
   return { pageId: created.id, url: created.url, action: "created" };
 }
@@ -320,10 +343,11 @@ function runStatus(errors, sourceStats) {
   return "Completed";
 }
 
-function sourceSummary(sourceStats) {
-  return sourceStats
+function sourceSummary(sourceStats, sourceMode) {
+  const stats = sourceStats
     .map((stat) => `${stat.source}: ${stat.successes} ok, ${stat.failures} failed, ${stat.jobs} fetched`)
     .join("; ");
+  return `Mode: ${sourceMode}; ${stats}`;
 }
 
 function errorSummary(errors) {
@@ -334,13 +358,13 @@ function errorSummary(errors) {
     .join("\n");
 }
 
-function buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats }) {
+function buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats, sourceMode }) {
   const runDate = dateProperty(startedAt);
   return {
     "Run Key": titleText(runKey),
     ...(runDate ? { "Run Date": runDate } : {}),
     "Run Week": richText(getIsoWeek(startedAt)),
-    Source: richText(sourceSummary(sourceStats)),
+    Source: richText(sourceSummary(sourceStats, sourceMode)),
     Status: { select: { name: runStatus(errors, sourceStats) } },
     Location: richText(location),
     "Target Roles": { number: targets.length },
@@ -377,7 +401,7 @@ function buildJobProperties(job, runKey, finishedAt) {
   };
 }
 
-async function writeNotionResults({ startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats }) {
+async function writeNotionResults({ startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats, sourceMode }) {
   if (!process.env.NOTION_TOKEN) {
     return { skipped: true, reason: "Missing NOTION_TOKEN" };
   }
@@ -431,7 +455,7 @@ async function writeNotionResults({ startedAt, finishedAt, location, targets, jo
     databaseId: runsDatabaseId,
     filter: { property: "Run Key", title: { equals: runKey } },
     icon: { type: "emoji", emoji: "🔎" },
-    properties: buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats }),
+    properties: buildRunProperties({ runKey, startedAt, finishedAt, location, targets, jobs, uniqueJobs, errors, sourceStats, sourceMode }),
   });
 
   const jobResults = [];
@@ -448,6 +472,7 @@ async function writeNotionResults({ startedAt, finishedAt, location, targets, jo
 
   return {
     runKey,
+    sourceMode,
     runsDatabaseId,
     jobsDatabaseId,
     runPageId: run.pageId,
@@ -484,21 +509,21 @@ export default async function handler(req, res) {
   const startedAt = new Date().toISOString();
   const runId = getRunId();
   const runKey = getRunKey(startedAt);
+  const sourceMode = getSourceMode(req);
   const location = cleanText(req.query.location || req.body?.location || process.env.WEEKLY_SEARCH_LOCATION || DEFAULT_LOCATION);
   const targets = getSelectedTargets(req);
+  const selectedSources = sourceUrls(req, sourceMode);
 
   if (req.query.dryRun === "1" || req.query.dryRun === "true") {
     return res.status(200).json({
       runId,
       runKey,
+      sourceMode,
       dryRun: true,
       location,
       targetRolesSearched: targets.length,
       targets,
-      sources: [
-        process.env.SERP_SOURCE_URL || `${getBaseUrl(req)}/api/search-jobs`,
-        process.env.APIFY_SOURCE_URL || DEFAULT_APIFY_SOURCE_URL,
-      ],
+      sources: selectedSources,
       notionParentPageId: process.env.NOTION_WEEKLY_JOBS_PAGE_ID || DEFAULT_NOTION_PAGE_ID,
       notionDatabases: {
         runs: process.env.NOTION_RUNS_DATABASE_ID || RUNS_DATABASE_TITLE,
@@ -510,16 +535,10 @@ export default async function handler(req, res) {
 
   const errors = [];
   const jobs = [];
-  const sourceStats = [
-    { source: "SerpAPI / Google Jobs", successes: 0, failures: 0, jobs: 0 },
-    { source: "LinkedIn / Apify", successes: 0, failures: 0, jobs: 0 },
-  ];
+  const sourceStats = selectedSources.map((source) => ({ source: source.source, successes: 0, failures: 0, jobs: 0 }));
 
   for (const target of targets) {
-    const plannedSources = [
-      { source: "SerpAPI / Google Jobs", run: () => runSerpSearch(req, target, location) },
-      { source: "LinkedIn / Apify", run: () => runApifySearch(target, location) },
-    ];
+    const plannedSources = plannedSourcesFor(req, target, location, sourceMode);
     const results = await Promise.allSettled(plannedSources.map((source) => source.run()));
 
     for (const [index, result] of results.entries()) {
@@ -554,6 +573,7 @@ export default async function handler(req, res) {
       uniqueJobs: sortedJobs,
       errors,
       sourceStats,
+      sourceMode,
     });
   } catch (error) {
     notion = { error: error.message };
@@ -562,6 +582,7 @@ export default async function handler(req, res) {
   return res.status(200).json({
     runId,
     runKey,
+    sourceMode,
     location,
     startedAt,
     finishedAt,
