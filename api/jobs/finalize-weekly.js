@@ -25,13 +25,20 @@ export default async function handler(req, res) {
     const jobs = await fetchLatestJobsFromNotion({ runKey, limit: Number(req.query.limit || body.limit || 100) });
     const digest = buildJobDigest(jobs, { runKey });
     const notifications = send ? await sendJobNotifications(digest) : [];
-    const contentNotifications = send && contentReminder ? await sendContentReminder({ runKey }) : [];
+    const contentNotifications = send && contentReminder ? await sendContentReminder({ runKey, digest }) : [];
 
     return res.status(200).json({
       runKey,
       digest,
       notifications,
       contentNotifications,
+      logs: {
+        jobsAggregated: jobs.length,
+        telegram: {
+          digest: notifications.find((item) => item.channel === "telegram") || null,
+          contentReminder: contentNotifications.find((item) => item.channel === "telegram") || null,
+        },
+      },
     });
   } catch (error) {
     return res.status(500).json({ error: "Finalize failed", message: error.message, runKey });
