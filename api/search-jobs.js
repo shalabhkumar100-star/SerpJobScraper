@@ -23,6 +23,13 @@ function formatDate(date) {
   return date.toISOString().slice(0, 10);
 }
 
+function normaliseSerpLocation(value) {
+  const text = String(value || "London").trim();
+  if (/^london\s*,\s*uk$/i.test(text)) return "London";
+  if (/^london\s*,\s*united kingdom$/i.test(text)) return "London";
+  return text || "London";
+}
+
 function relativeToDate(value) {
   const text = String(value || "").toLowerCase();
   if (!text) return "";
@@ -116,7 +123,7 @@ export default async function handler(req, res) {
     const shouldExpand = !["0", "false", "no"].includes(String(req.query.expand || "1").toLowerCase());
     const maxQueries = Number(req.query.maxQueries || 12);
     const expandedRoles = (shouldExpand ? await expandRole(role) : [String(role).trim()]).slice(0, maxQueries);
-    const searchLocation = location || "London";
+    const searchLocation = normaliseSerpLocation(location);
     let allJobs = [];
     const diagnostics = [];
 
@@ -127,6 +134,7 @@ export default async function handler(req, res) {
       const jobsResults = data.jobs_results || [];
       diagnostics.push({
         query,
+        location: searchLocation,
         status: response.status,
         error: data.error || "",
         searchMetadataStatus: data.search_metadata?.status || "",
