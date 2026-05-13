@@ -1,8 +1,38 @@
 # NemoClaw Weekly Automation
 
-NemoClaw should be the weekly controller. This Vercel project exposes small, idempotent endpoints that NemoClaw can call safely without triggering a long single request.
+Vercel Cron is the temporary production scheduler. NemoClaw-facing endpoints remain in place so the orchestration can move to a NemoClaw/OpenClaw runtime later without changing the scraping primitives.
 
-## Weekly Flow
+## Production Cron Flow
+
+Vercel Cron calls the cron-safe runner every Monday at 08:00 UTC:
+
+```text
+GET /api/nemoclaw/weekly-run?source=both
+```
+
+That route:
+
+1. builds the same slice plan exposed by `/api/nemoclaw/weekly-plan`
+2. executes each slice through the shared slice runner
+3. retries failed slices up to 2 times by default
+4. finalizes the weekly digest
+5. sends the job-search notifications and weekly content reminder
+
+The runner supports safe validation without writes to sources beyond route execution:
+
+```text
+GET /api/nemoclaw/weekly-run?source=both&dryRun=1
+```
+
+For a bounded live smoke test, limit execution to one or a few slices and suppress notifications:
+
+```text
+GET /api/nemoclaw/weekly-run?source=serp&maxSlices=1&send=0&runKey=smoke-test
+```
+
+## NemoClaw-Compatible Manual Flow
+
+A future NemoClaw runtime can still orchestrate the same sequence directly.
 
 1. Call the plan endpoint:
 
@@ -93,8 +123,11 @@ HIGH_PRIORITY_JOB_SCORE=5
 URGENT_DEADLINE_DAYS=5
 NOTIFICATION_TOP_JOBS=10
 NOTIFICATION_URGENT_JOBS=5
+WEEKLY_SLICE_RETRIES=2
+WEEKLY_MAX_SLICES=0
+WEEKLY_FINALIZE_JOB_LIMIT=100
 ```
 
 ## Fallback
 
-Vercel Cron should only be used as a temporary trigger for NemoClaw or another durable runner. Do not point cron at a full all-roles scrape; the system is intentionally slice-based.
+The legacy `/api/weekly-job-run` endpoint remains in the repository for manual fallback, but Vercel Cron no longer calls it.
