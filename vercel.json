@@ -2,7 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "crons": [
     {
-      "path": "/api/nemoclaw/weekly-run",
+      "path": "/api/nemoclaw/run-weekly",
       "schedule": "0 8 * * 1"
     }
   ]
