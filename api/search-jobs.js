@@ -87,6 +87,7 @@ function normaliseJob(job, sourceQuery) {
     role: job.title || "",
     company: job.company_name || "",
     location: job.location || "",
+    source: "SerpAPI / Google Jobs",
     posted: postedRaw,
     postedDate: relativeToDate(postedRaw) || "",
     deadline: deadlineRaw,
@@ -117,15 +118,34 @@ export default async function handler(req, res) {
     const expandedRoles = (shouldExpand ? await expandRole(role) : [String(role).trim()]).slice(0, maxQueries);
     const searchLocation = location || "London";
     let allJobs = [];
+    const diagnostics = [];
+
     for (const query of expandedRoles) {
       const params = new URLSearchParams({ engine: "google_jobs", q: query, location: searchLocation, hl: "en", gl: "uk", api_key: process.env.SERPAPI_KEY });
       const response = await fetch(`https://serpapi.com/search.json?${params}`);
       const data = await response.json();
-      const jobs = (data.jobs_results || []).map((job) => normaliseJob(job, query));
+      const jobsResults = data.jobs_results || [];
+      diagnostics.push({
+        query,
+        status: response.status,
+        error: data.error || "",
+        searchMetadataStatus: data.search_metadata?.status || "",
+        jobsResults: jobsResults.length,
+      });
+      if (!response.ok || data.error) continue;
+      const jobs = jobsResults.map((job) => normaliseJob(job, query));
       allJobs.push(...jobs);
     }
+
     const unique = dedupeJobs(allJobs).filter((job) => postedWithin7Days(job.posted));
-    return res.status(200).json({ jobs: unique.slice(0, 30), expandedRoles, totalFetched: allJobs.length, totalUnique: unique.length, filter: "last 7 days where posted metadata is available; blank when Google Jobs does not expose posting age" });
+    return res.status(200).json({
+      jobs: unique.slice(0, 30),
+      expandedRoles,
+      totalFetched: allJobs.length,
+      totalUnique: unique.length,
+      diagnostics,
+      filter: "last 7 days where posted metadata is available; blank when Google Jobs does not expose posting age",
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
