@@ -45,15 +45,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  register-workflow:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Register workflow
-        run: echo "Weekly Job Automation workflow registered. Use workflow_dispatch or schedule to run the scraper."
-
   run-weekly-job-automation:
-    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
@@ -73,6 +65,7 @@ jobs:
         run: |
           node <<'NODE'
           const fs = require("fs");
+          const eventName = process.env.GITHUB_EVENT_NAME;
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
           const inputs = event.inputs || {};
 
@@ -80,9 +73,9 @@ jobs:
           const secret = process.env.CRON_SECRET;
           const sourceMode = inputs.source || "both";
           const requestedRunKey = inputs.run_key || "";
-          const testMode = inputs.test === undefined ? false : String(inputs.test) === "true";
+          const testMode = eventName === "push" ? true : (inputs.test === undefined ? false : String(inputs.test) === "true");
           const sendNotifications = inputs.send_notifications === undefined ? true : String(inputs.send_notifications) !== "false";
-          const maxSlices = Number(inputs.max_slices || 0);
+          const maxSlices = eventName === "push" ? 2 : Number(inputs.max_slices || 0);
           const retries = Number(process.env.SLICE_RETRIES || 2);
 
           function headers() {
@@ -162,7 +155,7 @@ jobs:
           if (testMode) slices = oneSlicePerSource(slices);
           if (maxSlices > 0) slices = slices.slice(0, maxSlices);
 
-          console.log(`Plan ready: runKey=${plan.runKey} source=${plan.sourceMode} totalPlanned=${plan.totalSlices} totalToRun=${slices.length} testMode=${testMode}`);
+          console.log(`Plan ready: runKey=${plan.runKey} source=${plan.sourceMode} totalPlanned=${plan.totalSlices} totalToRun=${slices.length} testMode=${testMode} event=${eventName}`);
 
           const results = [];
           for (const slice of slices) {
@@ -190,6 +183,7 @@ jobs:
             runKey: plan.runKey,
             sourceMode,
             testMode,
+            eventName,
             attemptedSlices: results.length,
             failedSlices: failures.length,
             jobsCreated,
