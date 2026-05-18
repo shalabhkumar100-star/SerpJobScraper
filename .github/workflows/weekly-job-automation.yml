@@ -1,6 +1,11 @@
 name: Weekly Job Automation
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/weekly-job-automation.yml"
   schedule:
     - cron: "0 8 * * 1"
   workflow_dispatch:
@@ -40,17 +45,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  register-workflow:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Register workflow
+        run: echo "Weekly Job Automation workflow registered. Use workflow_dispatch or schedule to run the scraper."
+
   run-weekly-job-automation:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
       BASE_URL: ${{ vars.AUTOJOBSCRAPER_BASE_URL || 'https://autojobscraperagent.vercel.app' }}
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
-      SOURCE_MODE: ${{ inputs.source || 'both' }}
-      RUN_KEY: ${{ inputs.run_key || '' }}
-      TEST_MODE: ${{ inputs.test || 'false' }}
-      SEND_NOTIFICATIONS: ${{ inputs.send_notifications || 'true' }}
-      MAX_SLICES: ${{ inputs.max_slices || '0' }}
+      SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source || 'both' }}
+      RUN_KEY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_key || '' }}
+      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test || 'false' }}
+      SEND_NOTIFICATIONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.send_notifications || 'true' }}
+      MAX_SLICES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_slices || '0' }}
       SLICE_RETRIES: "2"
     steps:
       - name: Validate secrets
