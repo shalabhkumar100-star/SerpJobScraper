@@ -57,13 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
-      BASE_URL: ${{ vars.AUTOJOBSCRAPER_BASE_URL || 'https://autojobscraperagent.vercel.app' }}
+      BASE_URL: https://autojobscraperagent.vercel.app
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
-      SOURCE_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.source || 'both' }}
-      RUN_KEY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_key || '' }}
-      TEST_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.test || 'false' }}
-      SEND_NOTIFICATIONS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.send_notifications || 'true' }}
-      MAX_SLICES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.max_slices || '0' }}
       SLICE_RETRIES: "2"
     steps:
       - name: Validate secrets
@@ -77,13 +72,17 @@ jobs:
         shell: bash
         run: |
           node <<'NODE'
+          const fs = require("fs");
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+          const inputs = event.inputs || {};
+
           const baseUrl = process.env.BASE_URL.replace(/\/$/, "");
           const secret = process.env.CRON_SECRET;
-          const sourceMode = process.env.SOURCE_MODE || "both";
-          const requestedRunKey = process.env.RUN_KEY || "";
-          const testMode = String(process.env.TEST_MODE || "false") === "true";
-          const sendNotifications = String(process.env.SEND_NOTIFICATIONS || "true") !== "false";
-          const maxSlices = Number(process.env.MAX_SLICES || 0);
+          const sourceMode = inputs.source || "both";
+          const requestedRunKey = inputs.run_key || "";
+          const testMode = inputs.test === undefined ? false : String(inputs.test) === "true";
+          const sendNotifications = inputs.send_notifications === undefined ? true : String(inputs.send_notifications) !== "false";
+          const maxSlices = Number(inputs.max_slices || 0);
           const retries = Number(process.env.SLICE_RETRIES || 2);
 
           function headers() {
@@ -201,7 +200,7 @@ jobs:
             failures: failures.map((item) => ({ source: item.slice.source, offset: item.slice.offset, targetRole: item.slice.targetRole, error: item.error })),
           };
 
-          await require("fs/promises").writeFile("weekly-job-summary.json", JSON.stringify(summary, null, 2));
+          await fs.promises.writeFile("weekly-job-summary.json", JSON.stringify(summary, null, 2));
           console.log(JSON.stringify(summary, null, 2));
 
           if (failures.length) {
