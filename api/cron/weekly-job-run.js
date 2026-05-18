@@ -25,13 +25,11 @@ function isVercelCron(req) {
 
 export default async function handler(req, res) {
   const cronRequestId = `cron-${Date.now()}`;
-  const forceSmokeTest = process.env.CRON_FORCE_SMOKE_TEST !== "0";
   console.log("cron wrapper invoked", {
     cronRequestId,
     method: req.method,
     hasVercelCronSignal: hasVercelCronSignal(req),
     hasAuthorization: Boolean(headerValue(req, "authorization")),
-    forceSmokeTest,
   });
 
   if (!["GET", "POST"].includes(req.method)) return res.status(405).json({ error: "Method not allowed" });
@@ -46,9 +44,7 @@ export default async function handler(req, res) {
     ...req,
     query: {
       ...req.query,
-      source: req.query.source || (forceSmokeTest ? "serp" : process.env.WEEKLY_SOURCE_MODE || "both"),
-      test: req.query.test || (forceSmokeTest ? "1" : undefined),
-      runKey: req.query.runKey || (forceSmokeTest ? `cron-test-${new Date().toISOString().slice(0, 16)}` : undefined),
+      source: req.query.source || process.env.WEEKLY_SOURCE_MODE || "both",
     },
     headers: {
       ...req.headers,
