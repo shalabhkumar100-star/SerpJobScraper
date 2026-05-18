@@ -45,6 +45,8 @@ export default async function handler(req, res) {
     query: {
       ...req.query,
       source: req.query.source || process.env.WEEKLY_SOURCE_MODE || "both",
+      test: req.query.test || (genuineVercelCron ? "1" : undefined),
+      runKey: req.query.runKey || (genuineVercelCron ? `cron-test-${new Date().toISOString().slice(0, 16)}` : undefined),
     },
     headers: {
       ...req.headers,
