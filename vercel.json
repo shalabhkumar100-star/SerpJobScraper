@@ -3,7 +3,7 @@
   "crons": [
     {
       "path": "/api/cron/weekly-job-run",
-      "schedule": "0 16 * * 1"
+      "schedule": "20 16 * * 1"
     }
   ]
 }
