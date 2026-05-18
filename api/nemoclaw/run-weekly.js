@@ -102,6 +102,8 @@ export default async function handler(req, res) {
   const send = cleanText(req.query.send ?? body.send ?? "1") !== "0";
   const contentReminder = cleanText(req.query.contentReminder ?? body.contentReminder ?? "1") !== "0";
 
+  console.log("runWeekly request accepted", { runKey, sourceMode, testMode, dryRun, send });
+
   if (!["serp", "apify", "both"].includes(sourceMode)) {
     return res.status(400).json({ error: "source must be serp, apify, or both" });
   }
@@ -109,7 +111,10 @@ export default async function handler(req, res) {
   const plannedSlices = buildSlicePlan({ sourceMode, location, runKey, cluster });
   const slices = testMode ? firstSlicePerSource(plannedSlices) : plannedSlices;
 
+  console.log("runWeekly plan built", { runKey, totalPlannedSlices: plannedSlices.length, totalSlices: slices.length });
+
   if (dryRun) {
+    console.log("runWeekly dryRun completed", { runKey, totalSlices: slices.length });
     return res.status(200).json({
       dryRun: true,
       testMode,
@@ -126,7 +131,9 @@ export default async function handler(req, res) {
 
   const sliceResults = [];
   for (const slice of slices) {
+    console.log("runWeekly slice started", { runKey, source: slice.source, offset: slice.offset, targetRole: slice.targetRole });
     const result = await runSliceWithRetries(req, slice, retries);
+    console.log("runWeekly slice completed", { runKey, source: slice.source, offset: slice.offset, ok: result.ok, attempts: result.attempt });
     sliceResults.push(result);
   }
 
@@ -138,6 +145,7 @@ export default async function handler(req, res) {
 
   let finalize = null;
   try {
+    console.log("runWeekly finalize started", { runKey, jobsCreated, jobsUpdated, jobsTouched });
     const jobs = await fetchLatestJobsFromNotion({ runKey, limit: Number(process.env.WEEKLY_FINALIZE_JOB_LIMIT || 100) });
     const digest = buildJobDigest(jobs, { runKey });
     const notifications = send ? await sendJobNotifications(digest) : [];
@@ -152,11 +160,28 @@ export default async function handler(req, res) {
         contentReminder: contentNotifications.find((item) => item.channel === "telegram") || null,
       },
     };
+    console.log("runWeekly finalize completed", {
+      runKey,
+      totalJobs: digest.totalJobs,
+      telegramDigest: finalize.telegram.digest,
+      telegramContentReminder: finalize.telegram.contentReminder,
+    });
   } catch (error) {
     finalize = { ok: false, error: error.message };
+    console.log("runWeekly finalize failed", { runKey, message: error.message });
   }
 
   const finishedAt = new Date().toISOString();
+
+  console.log("runWeekly completed", {
+    runKey,
+    testMode,
+    slicesAttempted: sliceSummary.length,
+    slicesFailed: failedSlices.length,
+    jobsCreated,
+    jobsUpdated,
+    jobsTouched,
+  });
 
   return res.status(failedSlices.length ? 207 : 200).json({
     runKey,
