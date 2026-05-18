@@ -1,13 +1,8 @@
 name: Weekly Job Automation
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/weekly-job-automation.yml"
   schedule:
-    - cron: "0 8 * * 1"
+    - cron: "15 22 * * 1"
   workflow_dispatch:
     inputs:
       source:
@@ -27,7 +22,7 @@ on:
       test:
         description: "Run one slice per source, then finalize and send notifications"
         required: false
-        default: true
+        default: false
         type: boolean
       send_notifications:
         description: "Send Telegram/email/webhook notifications during finalize"
@@ -85,9 +80,9 @@ jobs:
           const secret = process.env.CRON_SECRET;
           const sourceMode = inputs.source || "both";
           const requestedRunKey = inputs.run_key || "";
-          const testMode = eventName === "push" ? true : (inputs.test === undefined ? false : String(inputs.test) === "true");
+          const testMode = inputs.test === undefined ? false : String(inputs.test) === "true";
           const sendNotifications = inputs.send_notifications === undefined ? true : String(inputs.send_notifications) !== "false";
-          const maxSlices = eventName === "push" ? 2 : Number(inputs.max_slices || 0);
+          const maxSlices = Number(inputs.max_slices || 0);
           const retries = Number(process.env.SLICE_RETRIES || 2);
 
           function appendSummary(title, value) {
@@ -221,7 +216,7 @@ jobs:
             appendSummary("Weekly Job Automation result", codeBlock(summary));
 
             if (failures.length) {
-              console.log("Some slices failed, but finalize still ran. Marking smoke test as successful if Telegram/finalize completed.");
+              console.log("Some slices failed, but finalize still ran. Marking run successful if Telegram/finalize completed.");
             }
           }
 
