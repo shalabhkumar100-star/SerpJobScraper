@@ -9,26 +9,29 @@ function headerValue(req, name) {
   return Array.isArray(value) ? value[0] : value || "";
 }
 
-function hasVercelCronHeader(req) {
+function hasVercelCronSignal(req) {
   const cronHeader = headerValue(req, "x-vercel-cron").toLowerCase();
-  return cronHeader === "1" || cronHeader === "true";
+  const userAgent = headerValue(req, "user-agent").toLowerCase();
+  return cronHeader === "1" || cronHeader === "true" || userAgent.includes("vercel-cron");
 }
 
 function isVercelCron(req) {
   const authHeader = headerValue(req, "authorization");
 
-  if (hasVercelCronHeader(req)) return true;
+  if (hasVercelCronSignal(req)) return true;
   if (process.env.CRON_SECRET && authHeader === `Bearer ${process.env.CRON_SECRET}`) return true;
   return false;
 }
 
 export default async function handler(req, res) {
   const cronRequestId = `cron-${Date.now()}`;
+  const forceSmokeTest = process.env.CRON_FORCE_SMOKE_TEST !== "0";
   console.log("cron wrapper invoked", {
     cronRequestId,
     method: req.method,
-    hasVercelCronHeader: hasVercelCronHeader(req),
+    hasVercelCronSignal: hasVercelCronSignal(req),
     hasAuthorization: Boolean(headerValue(req, "authorization")),
+    forceSmokeTest,
   });
 
   if (!["GET", "POST"].includes(req.method)) return res.status(405).json({ error: "Method not allowed" });
@@ -37,16 +40,15 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "Unauthorized cron request" });
   }
 
-  const genuineVercelCron = hasVercelCronHeader(req);
-  console.log("cron auth passed", { cronRequestId, genuineVercelCron });
+  console.log("cron auth passed", { cronRequestId });
 
   const cronReq = {
     ...req,
     query: {
       ...req.query,
-      source: req.query.source || process.env.WEEKLY_SOURCE_MODE || "both",
-      test: req.query.test || (genuineVercelCron ? "1" : undefined),
-      runKey: req.query.runKey || (genuineVercelCron ? `cron-test-${new Date().toISOString().slice(0, 16)}` : undefined),
+      source: req.query.source || (forceSmokeTest ? "serp" : process.env.WEEKLY_SOURCE_MODE || "both"),
+      test: req.query.test || (forceSmokeTest ? "1" : undefined),
+      runKey: req.query.runKey || (forceSmokeTest ? `cron-test-${new Date().toISOString().slice(0, 16)}` : undefined),
     },
     headers: {
       ...req.headers,
