@@ -1,0 +1,170 @@
+name: Run Weekly Automation Now
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/run-weekly-now.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-job-automation
+  cancel-in-progress: false
+
+jobs:
+  run-weekly-now:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      BASE_URL: https://autojobscraperagent.vercel.app
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
+      SLICE_RETRIES: "2"
+    steps:
+      - name: Check required configuration
+        run: |
+          {
+            echo "## Run Weekly Automation Now configuration"
+            echo ""
+            echo "Base URL: $BASE_URL"
+            if [ -z "$CRON_SECRET" ]; then
+              echo "CRON_SECRET: missing"
+            else
+              echo "CRON_SECRET: present"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error title=Missing CRON_SECRET::Add CRON_SECRET under Settings > Secrets and variables > Actions > Repository secrets."
+            exit 1
+          fi
+
+      - name: Run full weekly pipeline
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          const baseUrl = process.env.BASE_URL.replace(/\/$/, "");
+          const secret = process.env.CRON_SECRET;
+          const retries = Number(process.env.SLICE_RETRIES || 2);
+
+          function appendSummary(title, value) {
+            fs.appendFileSync(summaryPath, `\n## ${title}\n\n${value}\n`);
+          }
+
+          function codeBlock(value) {
+            return "```json\n" + JSON.stringify(value, null, 2) + "\n```";
+          }
+
+          function headers() {
+            return { Authorization: `Bearer ${secret}` };
+          }
+
+          function url(path, params = {}) {
+            const target = new URL(path, baseUrl);
+            for (const [key, value] of Object.entries(params)) {
+              if (value !== undefined && value !== null && String(value) !== "") {
+                target.searchParams.set(key, String(value));
+              }
+            }
+            return target;
+          }
+
+          async function fetchJson(target, options = {}) {
+            const response = await fetch(target, {
+              ...options,
+              headers: { ...headers(), ...(options.headers || {}) },
+            });
+            const text = await response.text();
+            let data = {};
+            try { data = text ? JSON.parse(text) : {}; }
+            catch { data = { raw: text }; }
+            if (!response.ok) {
+              const message = data.message || data.error || data.raw || `HTTP ${response.status}`;
+              const error = new Error(message);
+              error.status = response.status;
+              error.url = String(target);
+              error.data = data;
+              throw error;
+            }
+            return data;
+          }
+
+          async function runSlice(slice) {
+            let lastError = null;
+            for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
+              try {
+                console.log(`Slice start: ${slice.source} offset=${slice.offset} target=${slice.targetRole} attempt=${attempt}`);
+                const result = await fetchJson(url("/api/jobs/run-slice", {
+                  source: slice.source,
+                  offset: slice.offset,
+                  limit: slice.limit,
+                  location: slice.location,
+                  runKey: slice.runKey,
+                }));
+                console.log(`Slice ok: ${slice.source} offset=${slice.offset} unique=${result.totalUniqueLast7Days || 0} touched=${result.notion?.jobRowsTouched || 0}`);
+                return { ok: true, slice, result, attempt };
+              } catch (error) {
+                lastError = error;
+                console.log(`Slice failed: ${slice.source} offset=${slice.offset} attempt=${attempt} status=${error.status || "n/a"} message=${error.message}`);
+                if (attempt <= retries) await new Promise((resolve) => setTimeout(resolve, 5000 * attempt));
+              }
+            }
+            return { ok: false, slice, error: lastError?.message || "Unknown slice failure", status: lastError?.status || null };
+          }
+
+          async function main() {
+            const plan = await fetchJson(url("/api/nemoclaw/weekly-plan", { source: "both" }));
+            const slices = plan.slices || [];
+            console.log(`Plan ready: runKey=${plan.runKey} totalPlanned=${plan.totalSlices} totalToRun=${slices.length} testMode=false`);
+
+            const results = [];
+            for (const slice of slices) results.push(await runSlice(slice));
+
+            const failures = results.filter((item) => !item.ok);
+            const jobsCreated = results.reduce((sum, item) => sum + (item.result?.notion?.jobRowsCreated || 0), 0);
+            const jobsUpdated = results.reduce((sum, item) => sum + (item.result?.notion?.jobRowsUpdated || 0), 0);
+            const jobsTouched = results.reduce((sum, item) => sum + (item.result?.notion?.jobRowsTouched || 0), 0);
+
+            const finalize = await fetchJson(url("/api/jobs/finalize-weekly", {
+              runKey: plan.runKey,
+              send: "1",
+              contentReminder: "1",
+            }));
+
+            const summary = {
+              runKey: plan.runKey,
+              sourceMode: "both",
+              testMode: false,
+              attemptedSlices: results.length,
+              failedSlices: failures.length,
+              jobsCreated,
+              jobsUpdated,
+              jobsTouched,
+              totalJobs: finalize.digest?.totalJobs || 0,
+              telegram: finalize.logs?.telegram || null,
+              failures: failures.map((item) => ({ source: item.slice.source, offset: item.slice.offset, targetRole: item.slice.targetRole, status: item.status, error: item.error })),
+            };
+
+            await fs.promises.writeFile("weekly-job-summary.json", JSON.stringify(summary, null, 2));
+            console.log(JSON.stringify(summary, null, 2));
+            appendSummary("Full Weekly Automation result", codeBlock(summary));
+          }
+
+          main().catch(async (error) => {
+            const failure = { message: error.message, status: error.status || null, url: error.url || null, response: error.data || null };
+            console.error("Full weekly automation failed:", JSON.stringify(failure, null, 2));
+            appendSummary("Full Weekly Automation failure", codeBlock(failure));
+            await fs.promises.writeFile("weekly-job-summary.json", JSON.stringify({ failure }, null, 2));
+            process.exit(1);
+          });
+          NODE
+
+      - name: Upload run summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-job-summary
+          path: weekly-job-summary.json
+          if-no-files-found: ignore
