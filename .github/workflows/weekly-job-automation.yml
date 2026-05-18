@@ -53,10 +53,21 @@ jobs:
       CRON_SECRET: ${{ secrets.CRON_SECRET }}
       SLICE_RETRIES: "2"
     steps:
-      - name: Validate secrets
+      - name: Check required configuration
         run: |
+          {
+            echo "## Weekly Job Automation configuration"
+            echo ""
+            echo "Base URL: $BASE_URL"
+            if [ -z "$CRON_SECRET" ]; then
+              echo "CRON_SECRET: missing"
+            else
+              echo "CRON_SECRET: present"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
           if [ -z "$CRON_SECRET" ]; then
-            echo "Missing required GitHub Actions secret: CRON_SECRET"
+            echo "::error title=Missing CRON_SECRET::Add CRON_SECRET under Settings > Secrets and variables > Actions > Repository secrets. Use the same rotated value configured in Vercel."
             exit 1
           fi
 
@@ -196,6 +207,7 @@ jobs:
 
           await fs.promises.writeFile("weekly-job-summary.json", JSON.stringify(summary, null, 2));
           console.log(JSON.stringify(summary, null, 2));
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `\n## Weekly Job Automation result\n\n\`\`\`json\n${JSON.stringify(summary, null, 2)}\n\`\`\`\n`);
 
           if (failures.length) {
             process.exitCode = 1;
